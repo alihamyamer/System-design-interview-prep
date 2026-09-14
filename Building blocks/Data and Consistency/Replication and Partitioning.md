@@ -1,188 +1,107 @@
-Replication and Partitioning for Senior and Staff-Level Interviews
+# Replication and Partitioning
 
-Replication and partitioning are core scaling and availability techniques in distributed systems. At senior and staff level, the key is understanding why data is copied, why data is split, and what correctness and operational complexity each decision introduces.
+## Why this topic is a filter question
 
-1. What replication is
+Everyone knows replication copies data and partitioning splits it. The filter is whether you can reason about the *mechanics* that make each one hard: how replication actually propagates writes (and what that implies for lag and failover), how a partition key choice ripples through every future query and resharding effort, and how the two techniques compose — because almost every real large-scale datastore uses both simultaneously, not one or the other.
 
-Replication means storing copies of data on multiple nodes.
+---
 
-Why replication exists:
+## 1. Replication: why, and by what mechanism
 
-- improve availability
-- protect against node failure
-- improve read scale
-- reduce geographic latency
+Replication exists for four distinct reasons, worth naming separately because they lead to different design choices:
+- **Durability** — losing a node shouldn't lose data.
+- **Availability** — a node failing shouldn't take down reads (or writes, depending on the model).
+- **Read scale** — spread read load across multiple copies.
+- **Geographic latency** — put a copy near the reader.
 
-2. Common replication models
+### Primary-replica (the default mental model)
 
-Primary-replica:
+Writes go to one primary; replicas apply the same writes, typically by shipping the primary's write-ahead log (WAL) or a logical change stream. Two propagation modes matter operationally:
 
-- one primary handles writes
-- replicas copy data from the primary
+- **Synchronous replication**: the primary waits for (some number of) replicas to confirm before acknowledging the write to the client. Stronger durability guarantee (a replica has the data before the client is told it succeeded), at the cost of write latency bounded by the slowest replica you wait for.
+- **Asynchronous replication**: the primary acknowledges immediately, replicas catch up afterward. Lower write latency, but a primary failure before a replica applies the write means **that write is lost** even though the client was told it succeeded — this is the concrete failure mode behind "replication lag," not an abstract inconvenience.
 
-Multi-primary:
+Most real systems use a hybrid: synchronous to one nearby replica (for durability on failover) and asynchronous to the rest (for read scale and geographic distribution) — naming this hybrid explicitly, rather than treating replication as binary sync-or-async, is a good signal.
 
-- more than one node accepts writes
-- useful in some architectures, but introduces conflict complexity
+### Failover — the part that's usually hand-waved
 
-Leaderless replication:
+"Replicas take over if the primary fails" hides real complexity:
+- **Detection**: how does the system know the primary is actually down versus just slow or partitioned from the coordinator (a false positive here causes a split-brain — see below)?
+- **Promotion**: which replica becomes the new primary? Usually the one with the most up-to-date log position, but if replication was asynchronous, the most-caught-up replica can still be behind — meaning **failover can lose recently-acknowledged writes**, a fact worth stating rather than glossing over.
+- **Split-brain**: if the old primary isn't actually dead — just network-partitioned from the health-check system — and a replica gets promoted, you can end up with two nodes both accepting writes as "the primary." Fencing mechanisms (the old primary must be confirmed stopped/unreachable before promotion completes, e.g., via a lease or STONITH-style mechanism) exist specifically to prevent this.
 
-- multiple nodes may accept writes without one permanent leader
+### Multi-leader and leaderless
 
-Why this matters:
+- **Multi-leader**: more than one node accepts writes (common in multi-region setups where each region writes locally for latency). Buys write availability during a partition and lower write latency per region, at the direct cost of needing conflict resolution (see [Consistency and CAP §4](Consistency%20and%20CAP.md#4-conflict-resolution-when-replicas-diverge "Conflict resolution when replicas diverge")) since two leaders can accept conflicting writes to the same record concurrently.
+- **Leaderless (Dynamo-style)**: any replica can accept a write; consistency is tuned via quorums (`N`, `R`, `W` — see [Consistency and CAP §3](Consistency%20and%20CAP.md#3-quorums-the-mechanism-behind-tunable-consistency 'Quorums — the mechanism behind "tunable consistency"')). Buys very high write availability, at the cost of the quorum/conflict-resolution machinery becoming a first-class part of the system rather than an edge case.
 
-- each model makes different tradeoffs in consistency, write complexity, and failure handling
+---
 
-3. Primary-replica replication
+## 2. Partitioning: the key choice is the whole design
 
-This is the most common mental model in interviews.
+Partitioning (sharding) splits data across nodes so no single node holds — or has to process writes for — the entire dataset. The partition key decision is the highest-leverage decision in this space because **it determines which queries are cheap (single-partition) and which are expensive (cross-partition) for the rest of the system's life.**
 
-How it works:
+### Partitioning strategies
 
-- write goes to the primary
-- replicas copy the update
-- reads may go to either the primary or replicas depending on consistency needs
+- **Hash-based**: `partition = hash(key) % N`. Spreads load evenly if the key has good cardinality and low skew. Downside: range queries (`get all orders between two dates`) become a scatter-gather across every partition, since hashing destroys locality.
+- **Range-based**: partitions own contiguous key ranges (e.g., partition 1 = users A–F). Great for range queries and ordered scans, but concentrates load if writes cluster at one end of the range — the classic failure is auto-incrementing IDs or timestamp-prefixed keys, where all *new* writes land on the *same* "latest" partition regardless of total partition count.
+- **Directory-based**: a lookup service maps key → partition explicitly, rather than a formula. Most flexible (arbitrary rebalancing without a formula change), but the directory itself becomes a critical, must-scale, must-be-highly-available component.
 
-Benefits:
+### Choosing the key: work backward from access patterns, not forward from the schema
 
-- simpler write path
-- easy read scaling
+The question to actually ask is: **what's the dominant query, and does this key make that query single-partition?** A partition key that's "correct" in isolation (evenly distributed) can still be wrong if the dominant query pattern needs data that key doesn't co-locate. Concrete example: partitioning a multi-tenant SaaS system by `user_id` distributes load evenly, but if the dominant query is "give me all activity for tenant X" and users of the same tenant land on different partitions, every such query becomes a scatter-gather. Partitioning by `tenant_id` instead fixes that query at the cost of creating hot partitions for unusually large tenants — there usually isn't a key that's free on every axis; the job is picking which axis you're willing to pay on.
 
-Downsides:
+---
 
-- primary can become a bottleneck
-- replicas may lag
-- failover needs care
+## 3. Hot partitions — beyond "a celebrity gets a lot of traffic"
 
-4. Replication lag
+The celebrity-account example is the standard illustration, but the general mechanism is: **any partitioning scheme has some possible key-value distribution that breaks it**, and the design question is how you detect and mitigate it rather than assume it away:
 
-Replication lag means replicas are behind the primary.
+- **Detection**: per-partition metrics (QPS, latency, CPU) segmented by partition, not just fleet-wide averages — a fleet-wide p50 can look perfectly healthy while one partition is on fire.
+- **Mitigation without repartitioning everything**:
+  - **Key salting**: append a suffix/bucket number to a known-hot key (`hot_user_123#0` .. `hot_user_123#9`) to spread its writes across multiple partitions, at the cost of needing to fan out reads across those buckets when reading that key's full data.
+  - **Splitting a single hot partition further** (if your system supports dynamic range splitting, e.g., HBase/Bigtable-style) without touching the rest of the cluster's layout.
+  - **Caching in front of the hot partition** for read-heavy hot keys (see [Caching §10](../Scaling%20and%20Performance/Caching.md#10-what-separates-senior-from-staff-here "What separates senior from staff here")'s hot-key section) so the partition only has to absorb writes, not the full read volume too.
 
-Why this matters:
+---
 
-- a user may write data, then read from a replica and not see the update yet
+## 4. Resharding — the operation everyone underestimates
 
-Real example:
+Growth eventually forces adding partitions, and that means **moving data that already lives somewhere** — this is qualitatively different and harder than adding a stateless server behind a load balancer, because you can't just spin up a new empty partition and start routing to it; existing keys' current locations have to change without breaking in-flight traffic.
 
-- after changing account settings, the user may see the old value briefly if reads go to a lagging replica
+- **Naive `hash % N` re-sharding is the trap**: changing `N` (partition count) changes the target partition for nearly every key simultaneously, forcing almost all data to move at once.
+- **Consistent hashing** is the standard fix: keys and nodes are placed on a hash ring, and adding a node only remaps the keys between it and its neighbor on the ring — roughly `1/N` of keys move instead of nearly all of them. Worth being able to explain *why* it helps in exactly this terms, not just name-drop it.
+- **Live migration mechanics**: dual-write or shadow-write to both old and new locations during migration, backfill historical data, verify, then cut over reads — this is the same "expand-contract" discipline that shows up in [REST §5](../Communication/REST.md#5-versioning-what-actually-breaks-clients "Versioning — what actually breaks clients") versioning and [RPC and gRPC §5](../Communication/RPC%20and%20gRPC.md#5-schema-evolution-where-strong-typing-cuts-both-ways "Schema evolution — where strong typing cuts both ways") schema evolution: change happens gradually and reversibly, not as a single atomic flag-day cutover, because a flag-day cutover on live data at scale is exactly the kind of operation that turns a routine migration into an incident.
 
-5. What partitioning is
+---
 
-Partitioning means splitting data into subsets so not all data lives on one node.
+## 5. Cross-partition operations — the cost partitioning doesn't advertise
 
-Another common word is sharding.
+Splitting data across partitions makes anything that spans partitions harder, and this is worth naming as a direct, permanent cost of the decision rather than an occasional inconvenience:
 
-Why partitioning exists:
+- **Cross-partition transactions**: maintaining atomicity across partitions typically needs a distributed transaction protocol (two-phase commit or a saga-style compensating-transaction pattern), both of which add real latency and failure-mode complexity compared to a single-node transaction.
+- **Cross-partition queries/joins**: a query that needs data from multiple partitions becomes a scatter-gather — fan out to every relevant partition, merge results — which is slower and more failure-prone (now you depend on *every* partition responding, not just one) than a single-partition query.
+- **Secondary indexes across partitions**: an index on a field other than the partition key either has to be maintained per-partition (and queries scatter-gather across all of them) or maintained as a separate globally-partitioned index structure (which itself needs to stay consistent with the primary data) — this is a real design decision, not a checkbox feature.
 
-- increase write scale
-- increase total storage capacity
-- reduce contention on one machine
+---
 
-6. Good partition keys
+## 6. Replication and partitioning together
 
-A partition key decides where data lives.
+Almost every large-scale system combines both: data is **partitioned** across many nodes for write/storage scale, and **each partition is separately replicated** for durability and availability. This means the actual unit of failure/failover isn't "the database" — it's "one partition's primary," and a real design should describe both dimensions: "we partition by `tenant_id` into 128 shards for write scale, and each shard has a primary plus two replicas for durability and read scale" is a complete answer; naming only one dimension usually means the interviewer will ask about the other.
 
-Good partition keys:
+---
 
-- spread traffic fairly evenly
-- align with major query patterns
-- avoid concentrating all activity on one node
+## 7. What separates senior from staff here
 
-Examples:
+- **Senior**: knows primary-replica vs. multi-leader vs. leaderless, knows partitioning is for write/storage scale, can name a hot-partition example.
+- **Staff**: reasons about failover concretely (detection, promotion, split-brain risk, and that async replication means failover can lose recent writes); picks a partition key by working backward from the dominant query pattern rather than only checking distribution evenness; knows why naive `hash % N` resharding is dangerous and explains consistent hashing's actual mechanism; treats cross-partition transactions/queries as a standing architectural cost that shapes the rest of the design, not an edge case; describes replication and partitioning as two independent, composed dimensions rather than picking one.
 
-- `tenant_id`
-- `user_id`
-- `device_id`
+---
 
-Bad partition keys:
-
-- values with extreme skew
-- keys that force many cross-partition reads
-
-7. Hot partitions
-
-A hot partition happens when one partition receives much more traffic than others.
-
-Why it matters:
-
-- one shard becomes overloaded even if the rest of the cluster is fine
-
-Real example:
-
-- one celebrity account creates a hot user partition in a social system
-
-8. Repartitioning and resharding
-
-Traffic and data growth change over time, so partitioning is not a one-time design decision.
-
-Resharding means:
-
-- moving data as the cluster grows or the key distribution changes
-
-Why this is hard:
-
-- data movement is expensive
-- application routing may need changes
-- hot traffic may continue during migration
-
-9. Replication vs partitioning
-
-Replication:
-
-- copies the same data to multiple nodes
-- helps availability and read scale
-
-Partitioning:
-
-- splits different subsets of data across nodes
-- helps write scale and storage scale
-
-Most large systems use both.
-
-10. Common tradeoffs
-
-Replication helps:
-
-- durability
-- availability
-- read throughput
-
-But it also introduces:
-
-- lag
-- failover complexity
-- consistency tradeoffs
-
-Partitioning helps:
-
-- write throughput
-- storage scale
-
-But it also introduces:
-
-- cross-shard query difficulty
-- operational complexity
-- hot key risk
-
-11. Real examples
-
-Use replication for:
-
-- scaling read-heavy databases
-- keeping standby copies for failover
-- lowering read latency across regions
-
-Use partitioning for:
-
-- large event streams
-- very large tenant-based SaaS systems
-- high-write messaging or telemetry platforms
-
-12. Staff-level discussion prompts
-
-- Are we scaling for reads, writes, or both?
-- Can the product tolerate replica lag?
-- What is the partition key and why?
-- What happens if one partition becomes hot?
-- How hard will resharding be later?
-- Do clients ever need cross-partition transactions or queries?
+## 8. Questions to expect, and what a strong answer sounds like
+
+- **"The primary dies — walk me through what happens next."** → Detection (health check timeout), promotion (most-caught-up replica, note that async replication means potential data loss here), fencing against split-brain if the old primary isn't confirmed dead.
+- **"You need to add partitions because you're running out of write capacity — what's the actual process?"** → Not a `hash % N` change; consistent hashing or a directory-based remap so only a fraction of keys move; dual-write/backfill/cutover, not a flag-day migration.
+- **"One tenant is 100x the size of a typical tenant on your `tenant_id`-partitioned system — what happens, and what do you do?"** → Hot partition; detect via per-partition metrics; mitigate via key salting or dedicated capacity for that tenant rather than repartitioning the whole cluster.
+- **"How do you run a transaction that touches two shards?"** → Name the real options (2PC, sagas with compensation) and their cost, and ideally explain why you'd first try to avoid needing one by revisiting the partition key or denormalizing.
+- **"Users complain they don't see their own update immediately after making it."** → Diagnose as replication lag if reads can land on a replica; connect to read-your-writes consistency (see [Consistency and CAP §2](Consistency%20and%20CAP.md#2-consistency-models-precisely-not-just-by-name "Consistency models, precisely, not just by name")) as the specific guarantee to add, e.g., routing that user's read to the primary or a replica known to be caught up.

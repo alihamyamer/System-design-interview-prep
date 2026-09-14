@@ -1,203 +1,93 @@
-Server-Sent Events (SSE) for Senior and Staff-Level Interviews
+# Server-Sent Events (SSE)
 
-Server-Sent Events, or SSE, are a browser-friendly way for a server to push a stream of updates to a client over a long-lived HTTP connection. SSE is simpler than WebSockets when communication is one-way from server to client.
+## Why this topic is a filter question
 
-At senior and staff level, the important question is when SSE is the right real-time tool and when it is too limited.
+SSE is the "boring, correct" answer for one-way server push, and interviewers use it to check whether you reach for WebSockets reflexively (over-engineering) or dismiss SSE as a toy (under-informed). The filter is whether you can articulate precisely why one-way push doesn't need a bidirectional protocol, and what SSE actually guarantees — and doesn't — around delivery and reconnection.
 
-1. What SSE is
+For shared real-time-transport concepts (connection scaling, fan-out via a broker, reconnect storms), see [Websockets](Websockets.md) and [Long Polling](Long%20Polling.md) — this doc focuses on what's specific to SSE.
 
-SSE allows a server to keep an HTTP connection open and continuously send events to the client as new updates happen.
+---
 
-Important keyword: one-way streaming
+## 1. The mechanism
 
-- One-way streaming means the server sends updates to the client, but the client does not use the same connection to send arbitrary messages back.
-- If the client needs to send data, it usually does so through normal HTTP requests.
+The client opens a normal HTTP request (`GET /notifications/stream`) via the browser's `EventSource` API. The server keeps the response open and writes a sequence of text-formatted events to it over time, instead of closing after one response body:
 
-In browsers, SSE is commonly used through the `EventSource` API.
+```
+event: low_stock
+data: {"sku":"sku_123","available":4}
+id: 8842
 
-2. How SSE works
+event: low_stock
+data: {"sku":"sku_777","available":1}
+id: 8843
+```
 
-The client makes an HTTP request to an endpoint such as:
+- `data`: the payload (required)
+- `event`: an optional named event type, so the client can dispatch to different handlers
+- `id`: an event identifier — this is what makes reconnection self-healing ([§3](#3-reconnection-and-last-event-id-sses-actual-killer-feature "Reconnection and `Last-Event-ID` — SSE's actual killer feature"))
+- `retry`: a server-supplied hint for how long the client should wait before reconnecting
 
-- `GET /api/v1/notifications/stream`
+It's plain HTTP the whole way — no protocol upgrade, no special infrastructure requirement beyond "don't time out or buffer a long-lived response," which is the main reason it's the simplest of the three real-time options operationally.
 
-The server keeps the response open and periodically sends events formatted as text.
+---
 
-Important keyword: event stream
+## 2. Why one-way is a feature, not just a limitation
 
-- An event stream is a sequence of messages sent over one persistent HTTP response.
+The reflexive framing is "SSE is WebSockets without the send direction." The better framing: **most real-time UI features are actually one-way** — notifications, live dashboards, price tickers, job progress, activity feeds. The client's "writes" in these systems (marking a notification read, adjusting a dashboard filter) are almost always fine as ordinary REST calls, because they're infrequent and don't need to ride the same low-latency channel as the push stream.
 
-Common fields in SSE messages:
+Choosing SSE over WebSockets for a one-way feature isn't a compromise — it buys you real HTTP tooling for free: standard proxies, standard auth middleware, standard load balancer health checks, and (per §6) automatic browser-level reconnection that a raw WebSocket doesn't give you out of the box. The cases that genuinely need WebSockets are the ones where the *client* also needs to emit frequent, low-latency messages on the same channel — chat, multiplayer state, collaborative editing operations (see [Websockets §2](Websockets.md#2-the-actual-decision-does-the-client-need-to-speak-frequently-on-the-same-low-latency-channel "The actual decision: does the client need to speak, frequently, on the same low-latency channel?")).
 
-- `event`: optional event type
-- `data`: the payload
-- `id`: an event identifier
-- `retry`: reconnection hint
+---
 
-3. When to use SSE
+## 3. Reconnection and `Last-Event-ID` — SSE's actual killer feature
 
-SSE is a strong fit when:
+This is the detail that most differentiates a strong SSE answer from a shallow one. The `EventSource` browser API has **built-in automatic reconnection**: if the connection drops, the browser reconnects on its own (after the `retry` hint, or a default backoff) and sends a `Last-Event-ID` header set to the most recent `id` it saw.
 
-- the server needs to push updates to the client
-- communication is one-way
-- the client is a browser
-- you want something simpler than WebSockets
-- updates are moderate in frequency rather than ultra-high-frequency
+That means the *server* gets to decide what "resume" means, entirely through the `id` field:
+- If events are held in a short-lived buffer or a durable log keyed by ID, the server can replay everything after `Last-Event-ID` on reconnect — no gap, no duplicate suppression logic needed on the client.
+- If the server ignores `Last-Event-ID` and just resumes the live feed, reconnects silently drop whatever happened during the gap.
 
-Real examples:
+Whether that gap is acceptable is a business decision, not a technical one — worth stating explicitly: "a missed live notification is fine because the client can also refetch unread counts on demand" is a different answer than "a missed job-progress event means the UI shows the wrong state until the job finishes," and only the second one requires investing in a backing event log with replay.
 
-- live notifications in a web app
-- progress updates for long-running jobs
-- news or sports score updates
-- admin dashboards with live status changes
-- market or analytics dashboards with moderate real-time refresh
+---
 
-4. Why SSE exists
+## 4. Scaling: connection count is the constraint, and the fan-out problem is universal
 
-Without SSE, clients often poll:
+Like WebSockets, an SSE server holds one open connection per client for the lifetime of that client's session — the scaling ceiling is concurrent connections per instance, not requests per second. Where does the *data* for those connections come from across a horizontally scaled fleet? The same shape as every other push mechanism in this document set:
 
-- request every 5 seconds
-- ask if anything changed
+```
+producer --publish event--> broker (Redis Pub/Sub / Kafka / internal bus) --fan out--> N app servers --push--> connected clients
+```
 
-Polling is simpler, but wasteful when updates are infrequent and slow to react when the polling interval is large.
+Each app server subscribes to the topics its currently-connected clients care about and forwards matching events down their open SSE connections. The two follow-up questions worth pre-empting:
+- **Does a client need to stay pinned to the same server (sticky sessions)?** Only if server-local state matters beyond the open connection itself; if all routing state lives in the broker subscription, any server can serve any client, and a reconnect after a deploy can land anywhere.
+- **What's the per-instance connection ceiling?** Bounded by open file descriptors and per-connection memory more than CPU — worth sizing explicitly (e.g., "we expect 50k concurrent connections at peak, our instances handle ~20k comfortably, so we need at least 3 instances just for connection headroom, independent of event throughput").
 
-SSE improves this by letting the server push updates immediately over one open connection.
+---
 
-5. Strengths of SSE
+## 5. Reliability: SSE gives you a channel, not a delivery guarantee
 
-- simpler than WebSockets
-- uses normal HTTP
-- browser-friendly
-- good for server-to-browser real-time updates
-- easier to operate through HTTP infrastructure than some bidirectional protocols
+By default, SSE is **fire-and-forget from the server's perspective** — if nobody's listening when an event is published, it's gone unless you've built the replay mechanism in §3. This is worth contrasting explicitly with a durable message queue: SSE is the *last-mile delivery* mechanism to a connected browser, not a substitute for the durable event system that should sit behind it if the underlying facts matter (see [Message Queues and PubSub](../Async%20and%20Messaging/Message%20Queues%20and%20PubSub.md)). A common, correct architecture is: durable topic → SSE gateway subscribes and forwards to connected clients → client also has a REST endpoint to fetch current state on load/reconnect, so SSE is treated as a freshness optimization on top of a source of truth the client can always re-derive from, not the only path data travels.
 
-Why this matters:
+---
 
-- If you only need server push, SSE is often simpler and cheaper than introducing full-duplex communication.
+## 6. Security specifics
 
-6. Weaknesses of SSE
+- **Auth at connection time is not enough for long-lived streams.** A stream opened with a short-lived token can outlive that token; either re-validate periodically server-side, or design the stream to be cleanly closeable so the client is forced to reconnect (and re-auth) on a bounded interval.
+- **Per-tenant/per-user channel isolation must be enforced server-side**, not by obscurity of a channel name — a user should never be able to open `GET /stream?channel=other_org_id` and receive another tenant's events because the channel ID is guessable. The subscription the server sets up on the broker should be derived from the authenticated identity, not from a client-supplied parameter.
 
-- one-way only
-- text-based, not binary-focused
-- not ideal for highly interactive low-latency bidirectional systems
-- can be affected by proxy, timeout, or connection-limit behavior
-- less appropriate for non-browser clients in some ecosystems compared to gRPC streaming or WebSockets
+---
 
-7. SSE vs polling
+## 7. What separates senior from staff here
 
-Polling:
+- **Senior**: knows SSE is one-way server push over plain HTTP, knows it's simpler than WebSockets, can name the `EventSource` API.
+- **Staff**: treats `Last-Event-ID` + a backing buffer/log as the actual mechanism for a reliable resume, not an afterthought; sizes connection capacity explicitly as the scaling constraint; separates "is a missed event acceptable" as a product decision with different answers per feature; designs SSE as the last-mile layer on top of a durable event source rather than the source of truth itself; derives channel subscriptions from authenticated identity, never from client-supplied parameters.
 
-- the client repeatedly asks for updates
-- simpler mental model
-- wastes requests when nothing changes
+---
 
-SSE:
+## 8. Questions to expect, and what a strong answer sounds like
 
-- the client opens one connection
-- the server pushes updates when they happen
-- more efficient for server-to-client live updates
-
-Use SSE over polling when:
-
-- users need fresher updates
-- polling traffic would become wasteful
-- the communication is mostly one-way
-
-8. SSE vs WebSockets
-
-SSE:
-
-- one-way from server to client
-- simpler
-- usually better for browser event feeds
-
-WebSockets:
-
-- full-duplex, meaning both sides can send messages over the same connection
-- better for chat, games, collaborative editing, and other interactive systems
-
-A good interview answer:
-
-- choose SSE when you only need server push
-- choose WebSockets when both sides need to speak continuously
-
-9. Reconnection and event IDs
-
-SSE has built-in reconnection behavior in browsers.
-
-Important keyword: last event ID
-
-- If events include an `id`, the client can reconnect and tell the server the last event it received.
-- This helps the server resume or replay missed events, depending on system design.
-
-Why this matters:
-
-- Real-time systems lose connections.
-- A robust SSE design should think about reconnection and whether missed events can be replayed.
-
-10. Scaling considerations
-
-SSE uses long-lived connections, so scale depends on how many open connections the servers can handle.
-
-Questions to think about:
-
-- How many concurrent clients will stay connected?
-- Will load balancers or proxies time out idle connections?
-- Do you need sticky sessions or can any node resume the stream?
-- Where do events come from if the app is horizontally scaled?
-
-Common pattern:
-
-- application servers subscribe to a pub/sub layer or message bus
-- events are fanned out to connected clients
-
-11. Reliability considerations
-
-Important questions:
-
-- Are updates best-effort or guaranteed delivery?
-- Should the client replay missed events after reconnecting?
-- What happens if the server restarts?
-
-Real example:
-
-- For live notifications, missing one event may be acceptable if the UI can refetch the latest state.
-- For job progress or critical event history, you may need replay support or a backing event log.
-
-12. Security
-
-Security concerns include:
-
-- authenticating the stream request
-- ensuring the client only receives events it is allowed to see
-- rotating expired auth if the stream stays open a long time
-
-Real example:
-
-- A user should only receive their own notifications, not events for other users or tenants.
-
-13. Real examples
-
-Use SSE for:
-
-- browser notification feeds
-- long-running job progress
-- live admin dashboards
-- moderate-frequency stock or sports updates
-- system status pages
-
-Do not default to SSE for:
-
-- chat systems
-- multiplayer games
-- collaborative editing
-- systems that need binary payloads or intense bidirectional messaging
-
-14. Staff-level discussion prompts
-
-- Is the communication one-way or two-way?
-- How many concurrent open connections will exist?
-- What happens on reconnect?
-- Are missed events acceptable?
-- Do we need durable replay?
-- Would WebSockets or polling be simpler or more appropriate here?
+- **"A user's SSE connection drops for 10 seconds during a network blip — what do they see when it reconnects?"** → Depends entirely on whether the server implements `Last-Event-ID` replay; walk through both the "acceptable gap" and "needs replay from a backing log" cases and which features fall into each.
+- **"How do you push an event to a specific user when they might be connected to any of 50 app servers?"** → Broker-based fan-out (Redis Pub/Sub/Kafka) — each server subscribes on behalf of its currently connected clients; no sticky routing needed if that's the only shared state.
+- **"Why SSE instead of WebSockets here?"** → Name that the feature is one-way, and that SSE buys plain-HTTP infra compatibility and free browser-level reconnection in exchange for not needing client→server push on the same channel.
+- **"Could a user see another tenant's live events?"** → Only if channel subscription is derived from a client-supplied value instead of the authenticated session — describe deriving it server-side instead.
